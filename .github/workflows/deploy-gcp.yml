@@ -1,0 +1,84 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches:
+      - main  # main 브랜치에 푸시될 때 실행
+  workflow_dispatch:  # 수동 실행도 가능하게 함
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'  # OIDC 토큰 발급을 위한 권한
+      
+    env:
+      PROJECT_ID: 'just3lines'
+      REGION: 'asia-northeast3'  # GCP 리전 (서울)
+      REPO_NAME: 'j3l-docker-registry'  # Artifact Registry 저장소 이름
+      IMAGE: 'just3lines-api'
+      IMAGE_TAG: ${{ github.sha }}
+      SERVICE_NAME: 'just3lines'  # Cloud Run 서비스 이름
+
+    steps:
+    - name: 'Checkout repository'
+      uses: 'actions/checkout@v4'
+
+    - id: 'auth'
+      name: 'Authenticate to Google Cloud'
+      uses: 'google-github-actions/auth@v2'
+      with:
+        token_format: 'access_token'
+        project_id: ${{ env.PROJECT_ID }}
+        workload_identity_provider: 'projects/772476664444/locations/global/workloadIdentityPools/j3l-pool-id/providers/j3l-github-auth'
+        service_account: 'just3lines-github@just3lines.iam.gserviceaccount.com'
+
+    - name: 'Set up Cloud SDK'
+      uses: 'google-github-actions/setup-gcloud@v2'
+      with:
+        version: '>= 363.0.0'
+        
+    - name: 'Use gcloud CLI'
+      run: |
+        gcloud info
+        gcloud auth list
+
+    - name: Configure Docker for Artifact Registry
+      run: |
+        gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev
+
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }} .
+    
+    - name: Push Docker image to Artifact Registry
+      run: |
+        docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+        
+        # 최신 태그도 추가
+        docker tag ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }} \
+          ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE }}:latest
+        docker push ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE }}:latest
+        
+    - name: Deploy to Cloud Run
+      id: deploy
+      uses: google-github-actions/deploy-cloudrun@v2
+      with:
+        service: ${{ env.SERVICE_NAME }}
+        region: ${{ env.REGION }}
+        image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPO_NAME }}/${{ env.IMAGE }}:${{ env.IMAGE_TAG }}
+        flags: |
+          --allow-unauthenticated
+          --port=8000
+          --memory=512Mi
+          --cpu=1
+          --min-instances=0
+          --max-instances=10
+          --concurrency=80
+          --set-env-vars=OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+    
+    - name: Show Cloud Run URL
+      run: |
+        echo "Cloud Run URL: ${{ steps.deploy.outputs.url }}"
